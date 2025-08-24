@@ -1,0 +1,86 @@
+
+-- 1. Corrigir a função de busca de próximos agendamentos (remover GET DIAGNOSTICS)
+CREATE OR REPLACE FUNCTION buscar_proximos_agendamentos_dia_seguinte(clinica_uuid UUID)
+RETURNS TABLE (
+    id UUID,
+    paciente_nome TEXT,
+    paciente_email TEXT,
+    data_agendamento DATE,
+    horario TEXT,
+    tipo_exame TEXT,
+    medico_nome TEXT
+) AS $$
+BEGIN
+    -- Log simples para debug
+    RAISE NOTICE 'Buscando agendamentos para clínica: % na data: %', clinica_uuid, (CURRENT_DATE + INTERVAL '1 day')::DATE;
+    
+    RETURN QUERY
+    SELECT 
+        a.id,
+        p.nome as paciente_nome,
+        p.email as paciente_email,
+        a.data_agendamento::DATE,
+        COALESCE(a.horario, 'A definir') as horario,
+        a.tipo_exame,
+        COALESCE(m.nome_completo, 'Não definido') as medico_nome
+    FROM agendamentos a
+    LEFT JOIN pacientes p ON a.paciente_id = p.id
+    LEFT JOIN medicos m ON a.medico_id = m.id
+    WHERE a.clinica_id = clinica_uuid
+    AND a.data_agendamento::DATE = (CURRENT_DATE + INTERVAL '1 day')::DATE
+    AND a.status IN ('agendado', 'confirmado')
+    AND p.email IS NOT NULL
+    AND p.email != ''
+    AND p.email != 'N/A'
+    AND p.email !~ '^[0-9]+$'  -- Não números puros
+    AND p.email ~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'  -- Formato básico de email
+    AND p.email NOT ILIKE '%@teste%'
+    AND p.email NOT ILIKE '%@example%'
+    AND p.email NOT ILIKE '%@gmail.co'
+    AND p.email NOT ILIKE '%@hotmail.co'
+    -- LÓGICA SIMPLES: Se já tem lembrete enviado, não mostrar
+    AND NOT EXISTS (
+        SELECT 1 FROM email_lembretes el 
+        WHERE el.agendamento_id = a.id 
+        AND el.email_paciente = p.email 
+        AND el.status_envio = 'enviado'
+        AND el.clinica_id = clinica_uuid
+    )
+    ORDER BY a.horario NULLS LAST, a.created_at;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. Limpar dados duplicados
+DO $$
+DECLARE
+    registros_limpos INTEGER;
+BEGIN
+    WITH duplicados AS (
+        SELECT 
+            id,
+            ROW_NUMBER() OVER (
+                PARTITION BY agendamento_id, email_paciente, clinica_id 
+                ORDER BY 
+                    CASE WHEN status_envio = 'enviado' THEN 1 ELSE 2 END,
+                    data_envio DESC NULLS LAST,
+                    created_at DESC
+            ) as rn
+        FROM email_lembretes
+        WHERE agendamento_id IS NOT NULL
+    )
+    DELETE FROM email_lembretes 
+    WHERE id IN (
+        SELECT id FROM duplicados WHERE rn > 1
+    );
+    
+    GET DIAGNOSTICS registros_limpos = ROW_COUNT;
+    RAISE NOTICE 'Limpeza concluída: % registros duplicados removidos', registros_limpos;
+END;
+$$;
+
+-- 3. Criar índices para melhor performance
+CREATE INDEX IF NOT EXISTS idx_email_lembretes_agendamento_email_status 
+ON email_lembretes(agendamento_id, email_paciente, status_envio);
+
+CREATE INDEX IF NOT EXISTS idx_email_lembretes_clinica_status 
+ON email_lembretes(clinica_id, status_envio);
